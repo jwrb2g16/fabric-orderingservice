@@ -58,6 +58,11 @@ import org.hyperledger.fabric.sdk.security.CryptoPrimitives;
  *
  * @author joao
  */
+
+//BFT Shim - This is in the frontend
+//Has a client thread pool that receives envelopes and relays to ordering cluster
+//Reciever thread that collects blocks from the cluster
+
 public class BFTProxy {
 
     private static UnixDomainSocketServer recvServer = null;
@@ -74,11 +79,12 @@ public class BFTProxy {
     private static int nextID;
 
     private static ProxyReplyListener sysProxy;
-        
+
     private static Logger logger;
+    private static Logger jackLogger;
     private static String configDir;
     private static CryptoPrimitives crypto;
-    
+
     //measurements
     private static final int interval = 10000;
     private static long envelopeMeasurementStartTime = -1;
@@ -89,131 +95,132 @@ public class BFTProxy {
     private static final int countSigs = 0;
 
     public static void main(String args[]) throws ClassNotFoundException, IllegalAccessException, InstantiationException, CryptoException, InvalidArgumentException, NoSuchAlgorithmException, NoSuchProviderException, IOException {
-            
+
         if(args.length < 3) {
             System.out.println("Use: java bft.BFTProxy <proxy id> <pool size> <send port>");
             System.exit(-1);
-        }    
-        
+        }
+
         int pool = Integer.parseInt(args[1]);
         int sendPort = Integer.parseInt(args[2]);
-        
+
         Path proxy_ready = FileSystems.getDefault().getPath(System.getProperty("java.io.tmpdir"), "hlf-proxy-"+sendPort+".ready");
-            
+
         Files.deleteIfExists(proxy_ready);
-        
+
         configDir = BFTCommon.getBFTSMaRtConfigDir("FRONTEND_CONFIG_DIR");
-        
+
         if (System.getProperty("logback.configurationFile") == null)
             System.setProperty("logback.configurationFile", configDir + "logback.xml");
-        
+
         Security.addProvider(new BouncyCastleProvider());
-                
+
         BFTProxy.logger = LoggerFactory.getLogger(BFTProxy.class);
-        
+        BFTProxy.jackLogger = LoggerFactory.getLogger("Jack");
+
         frontendID = Integer.parseInt(args[0]);
         nextID = frontendID + 1;
-        
+
         crypto = new CryptoPrimitives();
         crypto.init();
         BFTCommon.init(crypto);
-        
+
         ECDSAKeyLoader loader = new ECDSAKeyLoader(frontendID, configDir, crypto.getProperties().getProperty(Config.SIGNATURE_ALGORITHM));
-        sysProxy = new ProxyReplyListener(frontendID, configDir, loader, Security.getProvider("BC"));        
-        
+        sysProxy = new ProxyReplyListener(frontendID, configDir, loader, Security.getProvider("BC"));
+
         try {
-            
+
             logger.info("Creating UNIX socket...");
-            
+
             Path socket_file = FileSystems.getDefault().getPath(System.getProperty("java.io.tmpdir"), "hlf-pool-"+sendPort+".sock");
-            
+
             Files.deleteIfExists(socket_file);
-            
+
             recvServer = new  UnixDomainSocketServer(socket_file.toString(), JUDS.SOCK_STREAM, pool);
             sendServer = new ServerSocket(sendPort);
 
             FileUtils.touch(proxy_ready.toFile()); //Indicate the Go component that the java component is ready
 
             logger.info("Waiting for local connections and parameters...");
-            
+
             recvSocket = recvServer.accept();
             is = new DataInputStream(recvSocket.getInputStream());
 
             executor = Executors.newFixedThreadPool(pool);
 
             for (int i = 0; i < pool; i++) {
-                
+
                 UnixDomainSocket socket = recvServer.accept();
-                                
+
                 executor.execute(new ReceiverThread(socket, nextID));
-                
+
                 nextID++;
             }
-            
+
             outputs = new TreeMap<>();
             timers = new TreeMap<>();
             BatchTimeout = new TreeMap<>();
-                        
+
             // request latest reply sequence from the ordering nodes
             sysProxy.invokeAsynchRequest(BFTCommon.assembleSignedRequest(sysProxy.getViewManager().getStaticConf().getPrivateKey(), frontendID, "SEQUENCE", "", new byte[]{}), null, TOMMessageType.ORDERED_REQUEST);
-                                   
+
             new SenderThread().start();
-                        
+
             logger.info("Java component is ready");
 
             while (true) { // wait for the creation of new channels
-            
+
                 sendSocket = sendServer.accept();
-                                
+
                 DataOutputStream os = new DataOutputStream(sendSocket.getOutputStream());
 
                 String channel = readString(is);
-                                
+
                 //byte[] bytes = readBytes(is);
-                
+
                 outputs.put(channel, os);
 
                 BatchTimeout.put(channel, readLong(is));
 
                 logger.info("Read BatchTimeout: " + BatchTimeout.get(channel));
-               
+
                 //sysProxy.invokeAsynchRequest(BFTUtil.assembleSignedRequest(sysProxy.getViewManager().getStaticConf().getRSAPrivateKey(), "NEWCHANNEL", channel, bytes), null, TOMMessageType.ORDERED_REQUEST);
-                
+
                 Timer timer = new Timer();
                 timer.schedule(new BatchTimeout(channel), (BatchTimeout.get(channel) / 1000000));
                 timers.put(channel, timer);
-                
+
                 logger.info("Setting up system for new channel '" + channel + "'");
 
                 nextID++;
-            
+
             }
 
         } catch (IOException e) {
-            
+
             logger.error("Failed to launch frontend", e);
             System.exit(1);
         }
     }
-    
+
     private static String readString(DataInputStream is) throws IOException {
-        
+
         byte[] bytes = readBytes(is);
-        
+
         return new String(bytes);
-        
+
     }
-    
+
     private static boolean readBoolean(DataInputStream is) throws IOException {
-        
+
         byte[] bytes = readBytes(is);
-        
+
         return bytes[0] == 1;
-        
+
     }
 
     private static byte[] readBytes(DataInputStream is) throws IOException {
-        
+
         long size = readLong(is);
 
         logger.debug("Read number of bytes: " + size);
@@ -227,7 +234,7 @@ public class BFTProxy {
         return bytes;
 
     }
-    
+
     private static long readLong(DataInputStream is) throws IOException {
         byte[] buffer = new byte[8];
 
@@ -262,29 +269,31 @@ public class BFTProxy {
         return value;
 
     }
-            
+
     private static synchronized void resetTimer(String channel) {
-        
+
         if (timers.get(channel) != null) timers.get(channel).cancel();
         Timer timer = new Timer();
         timer.schedule(new BatchTimeout(channel), (BatchTimeout.get(channel) / 1000000));
         timers.put(channel, timer);
     }
-    
-            
+
+    //This class receives envelopes for the frontends
     private static class ReceiverThread extends Thread {
-        
+
         private int id;
         private UnixDomainSocket recv;
         private DataInputStream input;
         private AsynchServiceProxy out;
-        
+
+        //Constructor
+
         public ReceiverThread(UnixDomainSocket recv, int id) throws IOException {
-                        
+
             this.id = id;
             this.recv = recv;
             this.input = new DataInputStream(this.recv.getInputStream());
-                        
+
             this.out = new AsynchServiceProxy(this.id, configDir, new KeyLoader() {
                 @Override
                 public PublicKey loadPublicKey(int i) throws IOException, NoSuchAlgorithmException, InvalidKeySpecException, CertificateException {
@@ -305,25 +314,25 @@ public class BFTProxy {
                 public String getSignatureAlgorithm() {
                     return null;
                 }
-                
+
             }, Security.getProvider("BC"));
-            
+
         }
-        
+        @SuppressWarnings("Duplicates")
         public void run() {
-            
+
             String channelID;
             boolean isConfig;
-            byte[] env; 
+            byte[] env;
             while (true) {
-                
+
 
                 try {
-                    
+
                     channelID = readString(this.input);
                     isConfig = readBoolean(this.input);
                     env = readBytes(this.input);
-                                
+
                     resetTimer(channelID);
 
                     logger.debug("Received envelope" + Arrays.toString(env) + " for channel id " + channelID + (isConfig ? " (type config)" : " (type normal)"));
@@ -341,23 +350,28 @@ public class BFTProxy {
                         @Override
                         public void replyReceived(RequestContext rc, TOMMessage tomm) {
 
+                            //If the message was acknowledged, increment the replies
                             if (Arrays.equals(tomm.getContent(), "ACK".getBytes())) replies++;
+
 
                             double q = Math.ceil((double) (out.getViewManager().getCurrentViewN() + out.getViewManager().getCurrentViewF() + 1) / 2.0);
 
+                            //If we have 2f+1 replies
+                            //THIS IS THE POINT A Transaction is final
                             if (replies >= q) {
-                                    out.cleanAsynchRequest(rc.getOperationId());
+                                out.cleanAsynchRequest(rc.getOperationId());
+                                jackLogger.info("Throughput: TRANSACTION COMMITTED BY 2f+1 Nodes");
                             }
                         }
 
                     }, TOMMessageType.ORDERED_REQUEST);
-                
-                
+
+
                 } catch (IOException ex) {
                     logger.error("Error while receiving envelope from Go component", ex);
                     continue;
                 }
-                
+
                 if (envelopeMeasurementStartTime == -1) {
                     envelopeMeasurementStartTime = System.currentTimeMillis();
                 }
@@ -371,7 +385,7 @@ public class BFTProxy {
                     envelopeMeasurementStartTime = System.currentTimeMillis();
 
                 }
-        
+
                 //byte[] reply = proxy.invokeOrdered(bytes);
 
                 //by = new byte[8];
@@ -388,49 +402,49 @@ public class BFTProxy {
         }
     }
     private static class SenderThread extends Thread {
-        
+
         public void run() {
 
             while (true) {
 
                 Map.Entry<String,Common.Block> reply = sysProxy.getNext();
-                
+
                 logger.info("Received block # " + reply.getValue().getHeader().getNumber());
-                
+
                 if (reply != null) {
 
                     try {
                         String[] params = reply.getKey().split("\\:");
-                        
+
                         boolean isConfig = Boolean.parseBoolean(params[1]);
-                        
+
                         if (isConfig) { //if config block, make sure to update the timeout in case it was changed
-                            
+
                             Common.Envelope env = Common.Envelope.parseFrom(reply.getValue().getData().getData(0));
                             Common.Payload payload = Common.Payload.parseFrom(env.getPayload());
                             Common.ChannelHeader chanHeader = Common.ChannelHeader.parseFrom(payload.getHeader().getChannelHeader());
 
                             if (chanHeader.getType() == Common.HeaderType.CONFIG_VALUE) {
-                            
+
                                 Configtx.ConfigEnvelope confEnv = Configtx.ConfigEnvelope.parseFrom(payload.getData());
                                 Map<String,Configtx.ConfigGroup> groups = confEnv.getConfig().getChannelGroup().getGroupsMap();
                                 Configuration.BatchTimeout timeout = Configuration.BatchTimeout.parseFrom(groups.get("Orderer").getValuesMap().get("BatchTimeout").getValue());
 
                                 Duration duration = BFTCommon.parseDuration(timeout.getTimeout());
                                 BatchTimeout.put(params[0], duration.toNanos());
-                            
+
                             }
                         }
-                        
+
                         byte[] bytes = reply.getValue().toByteArray();
                         DataOutputStream os = outputs.get(params[0]);
-                        
+
                         os.writeLong(bytes.length);
                         os.write(bytes);
-                        
+
                         os.writeLong(1);
-                        os.write(isConfig ? (byte) 1 : (byte) 0);                    
-                        
+                        os.write(isConfig ? (byte) 1 : (byte) 0);
+
                     } catch (IOException ex) {
                         logger.error("Error while sending block to Go component", ex);
                     }
@@ -439,32 +453,32 @@ public class BFTProxy {
         }
 
     }
-    
+
     private static class BatchTimeout extends TimerTask {
 
         String channel;
-        
+
         BatchTimeout(String channel) {
-            
+
             this.channel = channel;
         }
-        
+
         @Override
         public void run() {
-            
+
             try {
                 int reqId = sysProxy.invokeAsynchRequest(BFTCommon.assembleSignedRequest(sysProxy.getViewManager().getStaticConf().getPrivateKey(), frontendID, "TIMEOUT", this.channel,new byte[0]), null, TOMMessageType.ORDERED_REQUEST);
                 sysProxy.cleanAsynchRequest(reqId);
-                
+
                 Timer timer = new Timer();
                 timer.schedule(new BatchTimeout(this.channel), (BatchTimeout.get(channel) / 1000000));
-                
+
                 timers.put(this.channel, timer);
             } catch (IOException ex) {
                 logger.error("Failed to send envelope to nodes", ex);
             }
 
         }
-    
+
     }
 }
