@@ -1,7 +1,7 @@
-<configuration debug="false"> 
+<configuration debug="false">
 
   <!-- Logging to console -->
-  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender"> 
+  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
     <!-- encoders are  by default assigned the type
          ch.qos.logback.classic.encoder.PatternLayoutEncoder -->
     <encoder>
@@ -31,16 +31,29 @@
     <queueSize>1000</queueSize>
   </appender>
 
+  <appender name="JackFILE" class="ch.qos.logback.core.FileAppender">
+    <file>myApp_${NODE_ID}.log</file>
+    <encoder>
+      <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
 
   <root level="INFO">
     <!-- To use async logging use ref="ASYNC" instead -->
     <appender-ref ref="STDOUT" />
   </root>
-  
+
   <logger name="org.hyperledger.fabric.sdk" level="OFF" />
   <logger name="bftsmart" level="INFO" />
   <logger name="bft" level="INFO" />
   <logger name="io.netty" level="OFF" />
+
+  <!-- Added my own logger here -->
+  <logger name="Jack" level="INFO" >
+    <appender-ref ref="STDOUT" />
+    <appender-ref ref="JackFILE" />
+  </logger>
+
   <logger name="throughput" level="INFO" >
 
     <appender-ref ref="THROUGHPUT_FILE" />
